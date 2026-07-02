@@ -1,8 +1,8 @@
 # TSL2591 Lux Meter
 
 Arduino firmware for a TSL2591-based lux meter. It was initially built for
-`ddcci-screen-tuning`, where a host script needs stable ambient light readings
-to tune display brightness.
+[`ddcci-screen-tuning`](https://github.com/nicklausFR/ddcci-screen-tuning), where
+a host script needs stable ambient light readings to tune display brightness.
 
 ## Features
 
