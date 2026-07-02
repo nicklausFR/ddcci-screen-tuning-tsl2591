@@ -1,0 +1,22 @@
+{
+  "port": "",
+  "configuration": "softdevice=s140v6,debug=l0",
+  "output": "build",
+  "board": "Seeeduino:nrf52:xiaonRF52840Sense",
+  "programmer": "nrfjprog",
+  "useProgrammer": false,
+  "optimize_for_debug": false,
+  "configurationRequired": true,
+  "compile_profile": "profile-1782939730789",
+  "monitorPortSettings": {
+    "settings": {
+      "port": "",
+      "baudRate": 115200,
+      "lineEnding": "\r\n",
+      "dataBits": 8,
+      "parity": "none",
+      "stopBits": "one"
+    },
+    "profile_name": ""
+  }
+}
