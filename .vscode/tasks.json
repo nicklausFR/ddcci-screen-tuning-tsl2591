@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Update Arduino Maker Workshop port",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\update-workshop-port.ps1"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "Hard reboot NRF52840",
+      "type": "shell",
+      "command": "C:\\Users\\nicklaus\\Code\\Arduino\\Hard_reboot_NRF52840\\reset_xiao.bat",
+      "options": {
+        "cwd": "C:\\Users\\nicklaus\\Code\\Arduino\\Hard_reboot_NRF52840"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ]
+}

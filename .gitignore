@@ -1,7 +1,6 @@
 build/
 *.tmp
 *.log
-
-# Local workflow helpers.
-update-workshop-port.ps1
-.vscode/tasks.json
+__pycache__/
+*.py[cod]
+.staging-ddcci/
