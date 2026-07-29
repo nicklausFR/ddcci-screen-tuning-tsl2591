@@ -1,6 +1,7 @@
 """End-to-end probe using ddcci-screen-tuning's BLE ambient reader."""
 
 import argparse
+import asyncio
 import sys
 import threading
 import time
@@ -52,22 +53,64 @@ def main():
             pass
         if not controller.received.is_set():
             raise SystemExit(f"No BLE measurement received: {reader.last_error}")
-        reader.request_config()
+
+        ready_deadline = time.monotonic() + 30.0
+        while not reader.available and time.monotonic() < ready_deadline:
+            time.sleep(0.05)
+        if not reader.available:
+            raise SystemExit(
+                f"BLE reader did not finish connecting: {reader.last_error}"
+            )
+
+        def write_json(payload):
+            future = asyncio.run_coroutine_threadsafe(
+                reader._write_json_async(payload),
+                reader.event_loop,
+            )
+            try:
+                if not future.result(timeout=15.0):
+                    raise SystemExit(f"BLE write was not accepted: {payload}")
+            except Exception as exc:
+                raise SystemExit(f"BLE write failed for {payload}: {exc}") from exc
+
+        previous_config_at = reader._last_config_at or 0.0
+        write_json({"cmd": "config.get"})
         config_deadline = time.monotonic() + 45.0
-        while reader._last_config is None and time.monotonic() < config_deadline:
+        while (
+            (
+                (reader._last_config_at or 0.0) <= previous_config_at
+                or reader._last_config_cmd != "config.get"
+            )
+            and time.monotonic() < config_deadline
+        ):
             time.sleep(0.25)
+        if (
+            (reader._last_config_at or 0.0) <= previous_config_at
+            or reader._last_config_cmd != "config.get"
+        ):
+            raise SystemExit(
+                f"No post-connect sensor config received: {reader.last_error}"
+            )
         print("Sensor config:", reader._last_config)
 
         def apply_and_verify(changes):
             previous_config_at = reader._last_config_at or 0.0
             controller.received.clear()
-            if not reader.apply_config(changes):
-                raise SystemExit("Unable to queue BLE sensor configuration.")
+            payload = {"cmd": "config.set"}
+            payload.update(changes)
+            write_json(payload)
             apply_deadline = time.monotonic() + 45.0
-            while (
-                (reader._last_config_at or 0.0) <= previous_config_at
-                and time.monotonic() < apply_deadline
-            ):
+            while time.monotonic() < apply_deadline:
+                config_is_new = (
+                    (reader._last_config_at or 0.0) > previous_config_at
+                    and reader._last_config_cmd == "config.set"
+                )
+                config_matches = config_is_new and all(
+                    reader._last_config.get(name) == expected
+                    for name, expected in changes.items()
+                )
+                if config_matches:
+                    break
                 time.sleep(0.25)
             if reader._last_config_at is None or reader._last_config_at <= previous_config_at:
                 raise SystemExit(

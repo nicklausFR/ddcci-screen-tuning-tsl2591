@@ -54,7 +54,7 @@ const uint16_t COMMAND_MAX_LENGTH = 256;
 const uint8_t STARTUP_SETTLING_READS = 2;
 unsigned long lastReadMs = 0;
 
-const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-29-1";
+const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-29-2";
 const char *BLE_DEVICE_NAME = "LuxSensor";
 const uint8_t BLE_STATIC_ADDRESS[6] = {0x7D, 0x42, 0x91, 0x29, 0x5A, 0xCE};
 const uint16_t CONNECTION_INTERVAL_UNITS = 400; // 500 ms
@@ -194,6 +194,11 @@ void onBleDisconnected(uint16_t connectionHandle, uint8_t reason) {
 }
 
 void configureBle() {
+  // Allow a complete JSON response to fit in one ATT notification when the
+  // central negotiates the maximum MTU. This also increases the SoftDevice
+  // notification queue from one entry to three; idle connection parameters
+  // and radio duty cycle remain configured separately below.
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
   Bluefruit.begin(1, 0);
   ble_gap_addr_t address = {};
   address.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
@@ -467,9 +472,14 @@ void rememberSentLux(float lux, unsigned long now) {
 bool writeBleReliably(const uint8_t *data, size_t length) {
   size_t offset = 0;
   unsigned long deadline = millis() + 10000UL;
+  size_t maxChunkLength = 20;
+  BLEConnection *connection = Bluefruit.Connection(bleConnectionHandle);
+  if (connection != nullptr && connection->getMtu() > 3) {
+    maxChunkLength = connection->getMtu() - 3;
+  }
 
   while (offset < length && Bluefruit.connected()) {
-    size_t chunkLength = min((size_t)20, length - offset);
+    size_t chunkLength = min(maxChunkLength, length - offset);
     size_t written = bleUart.write(data + offset, chunkLength);
     if (written > 0) {
       offset += written;
