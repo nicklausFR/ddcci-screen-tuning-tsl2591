@@ -54,17 +54,24 @@ const uint16_t COMMAND_MAX_LENGTH = 256;
 const uint8_t STARTUP_SETTLING_READS = 2;
 unsigned long lastReadMs = 0;
 
-const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-29-4";
+const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-29-5";
 const char *BLE_DEVICE_NAME = "LuxSensor";
 const uint8_t BLE_STATIC_ADDRESS[6] = {0x7E, 0x42, 0x91, 0x29, 0x5A, 0xCE};
 const uint16_t FAST_CONNECTION_INTERVAL_MIN_UNITS = 12; // 15 ms
 const uint16_t FAST_CONNECTION_INTERVAL_MAX_UNITS = 24; // 30 ms
-const uint16_t LOW_POWER_CONNECTION_INTERVAL_UNITS = 400; // 500 ms
-const uint16_t LOW_POWER_CONNECTION_SLAVE_LATENCY = 4;
-const uint16_t CONNECTION_SUPERVISION_TIMEOUT_UNITS = 1000; // 10 s
-const int8_t BLE_TX_POWER_DBM = -8;
-const unsigned long BLE_LOW_POWER_SETTLE_MS = 5000UL;
-const unsigned long BLE_COMMAND_WATCHDOG_MS = 40000UL;
+// Windows proved unreliable with a 500 ms interval, latency 4 and -8 dBm:
+// established links frequently disappeared shortly after the parameter
+// update. Keep a moderate interval and attend every connection event. The
+// extra radio time is preferable to repeated discovery and reconnection.
+const uint16_t LOW_POWER_CONNECTION_INTERVAL_UNITS = 160; // 200 ms
+const uint16_t LOW_POWER_CONNECTION_SLAVE_LATENCY = 0;
+const uint16_t CONNECTION_SUPERVISION_TIMEOUT_UNITS = 2000; // 20 s
+const int8_t BLE_TX_POWER_DBM = 0;
+const unsigned long BLE_LOW_POWER_SETTLE_MS = 15000UL;
+// The Windows client sends a heartbeat every 30 s. Leave enough margin for a
+// temporarily delayed WinRT write without retaining an abandoned link
+// indefinitely.
+const unsigned long BLE_COMMAND_WATCHDOG_MS = 120000UL;
 
 const tsl2591Gain_t GAIN_STEPS[] = {
   TSL2591_GAIN_LOW,

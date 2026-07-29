@@ -20,7 +20,7 @@ adapt monitor brightness and contrast to ambient light.
 - `auto` publication on significant lux changes, or fixed `interval` mode.
 
 The consolidated firmware version is
-`tsl2591-ble-nus-2026-07-29-4`.
+`tsl2591-ble-nus-2026-07-29-5`.
 
 ## BLE protocol
 
@@ -104,15 +104,20 @@ Runtime configuration is not persisted across a reset.
 
 Windows needs a responsive link while it discovers GATT services. The firmware
 therefore starts with a requested 15–30 ms connection interval and no
-peripheral latency. Five seconds after the first host command, it requests the
-low-power parameters:
+peripheral latency. Fifteen seconds after the latest host command, it requests
+the steady-state parameters:
 
-- 500 ms connection interval;
-- peripheral latency 4;
-- 10 s supervision timeout;
-- -8 dBm transmit power.
+- 200 ms connection interval;
+- no peripheral latency;
+- 20 s supervision timeout;
+- 0 dBm transmit power.
 
 The central operating system makes the final parameter choice.
+
+The previous 500 ms / latency 4 / -8 dBm profile caused real link losses on
+Windows shortly after the connection parameter update. The current profile
+intentionally spends a little more radio time to avoid repeated GATT discovery
+and reconnection.
 
 The peripheral supports an ATT MTU up to 247 bytes and three queued
 notifications. This matters because a complete JSON configuration response is
@@ -148,17 +153,17 @@ The firmware and companion application use several mitigations:
 - NUS `write without response` for normal commands and confirmed writes for
   the short heartbeat;
 - a host heartbeat every 30 seconds;
-- a 40-second firmware command watchdog which disconnects an abandoned
+- a 120-second firmware command watchdog which disconnects an abandoned
   central and resumes advertising;
 - an application-level force-reconnect action.
 
 If Windows still holds a stale session:
 
 1. close every `ddcci-screen-tuning` instance;
-2. leave the XIAO powered and wait at least 40 seconds;
+2. leave the XIAO powered and wait at least 120 seconds;
 3. relaunch the application once;
 4. if GATT still times out, turn the Windows Bluetooth radio off and on, wait
-   for the 10-second supervision timeout, then relaunch.
+   for the 20-second supervision timeout, then relaunch.
 
 Power-cycling or reflashing the XIAO should not normally be necessary.
 
