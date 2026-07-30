@@ -54,7 +54,7 @@ const uint16_t COMMAND_MAX_LENGTH = 256;
 const uint8_t STARTUP_SETTLING_READS = 2;
 unsigned long lastReadMs = 0;
 
-const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-29-5";
+const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-30-6";
 const char *BLE_DEVICE_NAME = "LuxSensor";
 const uint8_t BLE_STATIC_ADDRESS[6] = {0x7E, 0x42, 0x91, 0x29, 0x5A, 0xCE};
 const uint16_t FAST_CONNECTION_INTERVAL_MIN_UNITS = 12; // 15 ms
@@ -95,6 +95,7 @@ const uint8_t QUALITY_SPECTRAL = 1 << 1;
 const uint8_t QUALITY_HELD = 1 << 2;
 const uint8_t QUALITY_ESTIMATED = 1 << 3;
 const uint8_t QUALITY_GAIN_SETTLED = 1 << 4;
+const uint8_t QUALITY_INVALID_CHANNELS = 1 << 5;
 
 uint8_t gainIndex = 1;
 float lastValidLux = NAN;
@@ -135,6 +136,7 @@ struct LightReading {
   float rawLevel;
   float irRatio;
   bool spectralOverload;
+  bool invalidChannels;
   bool gainSettled;
   uint8_t quality;
 };
@@ -302,6 +304,9 @@ void updateReadingQuality(LightReading& reading) {
   if (reading.gainSettled) {
     quality |= QUALITY_GAIN_SETTLED;
   }
+  if (reading.invalidChannels) {
+    quality |= QUALITY_INVALID_CHANNELS;
+  }
   reading.quality = quality;
 }
 
@@ -330,7 +335,17 @@ LightReading readSensorOnce() {
   uint16_t ir = luminosity >> 16;
   uint16_t full = luminosity & 0xFFFF;
   uint16_t visible = full > ir ? full - ir : 0;
-  float lux = tsl.calculateLux(full, ir);
+  // CH1 (IR) is a subset of CH0 (full spectrum). During sensor or power
+  // settling, a split register read can transiently return CH1 > CH0. Passing
+  // full=0 and ir>0 to Adafruit's formula produces +infinity, which used to
+  // poison the stabilization cache across all subsequent readings.
+  bool invalidChannels = ir > full;
+  float lux = NAN;
+  if (!invalidChannels) {
+    // Avoid the 0/0 term in Adafruit's formula in genuine complete darkness.
+    lux = full == 0 ? 0.0F : tsl.calculateLux(full, ir);
+  }
+  bool finiteLux = !isnan(lux) && !isinf(lux);
   bool hardSaturated = full >= SATURATION_COUNT || ir >= SATURATION_COUNT;
   bool adcOverRange = hardSaturated || full >= HIGH_COUNT || ir >= HIGH_COUNT;
   float irRatio = full > 0 ? (float)ir / (float)full : 0.0F;
@@ -352,10 +367,10 @@ LightReading readSensorOnce() {
 
   bool spectralOverload = spectralEnter || spectralHoldLatched;
   bool saturated = adcOverRange || spectralOverload;
-  bool valid = !hardSaturated && !isnan(lux) && lux >= 0;
+  bool valid = !invalidChannels && !hardSaturated && finiteLux && lux >= 0;
   LightReading reading = {full, ir, visible, lux, adcOverRange, saturated,
                           valid, false, false, rawLevel, irRatio,
-                          spectralOverload, false, 0};
+                          spectralOverload, invalidChannels, false, 0};
   updateReadingQuality(reading);
   return reading;
 }
@@ -400,7 +415,7 @@ LightReading readSensorAutoRange() {
 
     if (reading.spectralOverload && !isnan(luxPerRawLevel)) {
       float estimatedLux = reading.rawLevel * luxPerRawLevel;
-      if (estimatedLux > reading.lux) {
+      if (!isinf(estimatedLux) && estimatedLux > reading.lux) {
         reading.lux = estimatedLux;
         reading.estimated = true;
       }
@@ -447,7 +462,7 @@ LightReading readSensorAutoRange() {
 }
 
 bool shouldPublishReading(float lux, unsigned long now) {
-  bool luxIsValid = !isnan(lux) && lux >= 0.0F;
+  bool luxIsValid = !isnan(lux) && !isinf(lux) && lux >= 0.0F;
 
   if (!hasSentReading || luxIsValid != lastSentLuxWasValid) {
     return true;
@@ -475,7 +490,7 @@ bool shouldPublishReading(float lux, unsigned long now) {
 
 void rememberSentLux(float lux, unsigned long now) {
   hasSentReading = true;
-  lastSentLuxWasValid = !isnan(lux) && lux >= 0.0F;
+  lastSentLuxWasValid = !isnan(lux) && !isinf(lux) && lux >= 0.0F;
   lastSentLux = lux;
   lastSentMs = now;
 }
@@ -524,7 +539,8 @@ void publishReading(const LightReading& reading, unsigned long now) {
   packet.magic[1] = 'T';
   packet.version = 1;
   packet.quality = reading.quality;
-  packet.lux = (!isnan(reading.lux) && reading.lux >= 0.0F)
+  packet.lux = (!isnan(reading.lux) && !isinf(reading.lux) &&
+                reading.lux >= 0.0F)
                    ? reading.lux
                    : NAN;
   packet.visible = reading.visible;
