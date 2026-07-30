@@ -16,16 +16,17 @@ adapt monitor brightness and contrast to ambient light.
 - Fast initial connection for reliable Windows service discovery, followed by
   low-power connection parameters.
 - XIAO user LEDs disabled and onboard QSPI flash placed in deep power-down.
+- RTC2 wake scheduling and WFI sleep between sensor and BLE work.
 - Automatic recovery from abandoned or stale Windows BLE sessions.
 - `auto` publication on significant lux changes, or fixed `interval` mode.
 
 The consolidated firmware version is
-`tsl2591-ble-nus-2026-07-29-5`.
+`tsl2591-ble-nus-2026-07-30-7-wfi`.
 
 ## BLE protocol
 
 The peripheral advertises as `LuxSensor` with the static random address
-`CE:5A:29:91:42:7E`. It exposes Nordic UART Service:
+`C2:05:04:03:02:01`. It exposes Nordic UART Service:
 
 - service: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
 - RX/write: `6e400002-b5a3-f393-e0a9-e50e24dcca9e`
@@ -113,6 +114,10 @@ the steady-state parameters:
 - 0 dBm transmit power.
 
 The central operating system makes the final parameter choice.
+
+Between scheduled sensor work and BLE interrupts, the application suspends
+SysTick and enters WFI. RTC2 preserves the monotonic application clock and
+wakes the sensor loop at its configured refresh interval.
 
 The previous 500 ms / latency 4 / -8 dBm profile caused real link losses on
 Windows shortly after the connection parameter update. The current profile

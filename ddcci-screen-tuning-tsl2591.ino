@@ -5,11 +5,24 @@
 #include "Adafruit_SPIFlash.h"
 #include <bluefruit.h>
 #include "Adafruit_TSL2591.h"
+#include <NrfClock.h>
+#include <NrfWfiHandler.h>
+#include <WakeHandler.h>
 
 Adafruit_TSL2591 tsl = Adafruit_TSL2591(2591);
 Adafruit_FlashTransport_QSPI flashTransport;
 Adafruit_SPIFlash onboardFlash(&flashTransport);
 BLEUart bleUart;
+struct LightReading;
+NrfClock nrfClock;
+NrfWfiHandler nrfWfi;
+WakeHandler wakeHandler;
+
+const WakeMask RTC_WAKE_MASK = WakeHandler::source(31);
+
+unsigned long firmwareNowMs() {
+  return (unsigned long)nrfClock.monotonicMs();
+}
 
 // User-tunable defaults.
 // refreshMs controls the internal sensor polling cadence. Keep it low enough
@@ -54,9 +67,9 @@ const uint16_t COMMAND_MAX_LENGTH = 256;
 const uint8_t STARTUP_SETTLING_READS = 2;
 unsigned long lastReadMs = 0;
 
-const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-30-6";
+const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-07-30-7-wfi";
 const char *BLE_DEVICE_NAME = "LuxSensor";
-const uint8_t BLE_STATIC_ADDRESS[6] = {0x7E, 0x42, 0x91, 0x29, 0x5A, 0xCE};
+const uint8_t BLE_STATIC_ADDRESS[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0xC2};
 const uint16_t FAST_CONNECTION_INTERVAL_MIN_UNITS = 12; // 15 ms
 const uint16_t FAST_CONNECTION_INTERVAL_MAX_UNITS = 24; // 30 ms
 // Windows proved unreliable with a 500 ms interval, latency 4 and -8 dBm:
@@ -187,7 +200,7 @@ void turnOffUserLeds() {
 
 void onBleConnected(uint16_t connectionHandle) {
   bleConnectionHandle = connectionHandle;
-  lastBleCommandMs = millis();
+  lastBleCommandMs = firmwareNowMs();
   bleCommandSeen = false;
   lowPowerConnectionRequested = false;
   resetPublishState();
@@ -768,10 +781,31 @@ bool processJsonCommands(unsigned long now) {
   return published;
 }
 
+void sleepUntilNextSensorRead(unsigned long now) {
+  unsigned long elapsed = now - lastReadMs;
+  unsigned long sleepMs = elapsed < refreshMs ? refreshMs - elapsed : 1UL;
+
+  wakeHandler.consumeAll();
+  wakeHandler.scheduleRtcWakeIn(sleepMs);
+  while (!wakeHandler.hasAnyWake()) {
+    nrfWfi.sleepOnce();
+    wakeHandler.syncClockFromRtc();
+  }
+  wakeHandler.consumeAll();
+}
+
 void setup() {
   turnOffUserLeds();
   onboardFlash.begin();
   Wire.begin();
+
+  nrfClock.begin();
+  wakeHandler.begin(nrfClock);
+  wakeHandler.beginRtcWake(RTC_WAKE_MASK);
+  nrfWfi.setSuspendSysTickDuringSleep(true);
+  nrfWfi.setMaskNonWakeInterruptsDuringSleep(false);
+  nrfWfi.begin();
+
   configureBle();
   putOnboardFlashInDeepPowerDown();
   onboardFlash.end();
@@ -788,11 +822,11 @@ void setup() {
     readSensorAutoRange();
   }
   resetLightState();
-  lastReadMs = millis();
+  lastReadMs = firmwareNowMs();
 }
 
 void loop() {
-  unsigned long now = millis();
+  unsigned long now = firmwareNowMs();
   bool bleConnected = Bluefruit.connected();
 
   if (bleConnected && !bleWasConnected) {
@@ -825,7 +859,7 @@ void loop() {
   }
 
   if (now - lastReadMs < refreshMs) {
-    delay(10);
+    sleepUntilNextSensorRead(now);
     return;
   }
   lastReadMs = now;
