@@ -16,5 +16,5 @@ profiles:
       bits: "8"
       parity: none
       stop_bits: "1"
-    port: COM8
+    port: COM12
 default_profile: profile-1782939730789

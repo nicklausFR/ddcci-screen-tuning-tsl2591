@@ -23,6 +23,7 @@ class ProbeController:
         self.last_measurement = measurement
         self.received.set()
         print("Measurement:", measurement)
+        return True
 
     def close(self):
         pass

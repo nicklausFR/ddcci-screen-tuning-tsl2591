@@ -1,7 +1,7 @@
 # TSL2591 BLE Lux Meter
 
 Firmware for a TSL2591 ambient-light sensor connected to a Seeed XIAO
-nRF52840 Sense. It is the wireless sensor used by
+nRF52840. It is the wireless sensor used by
 [`ddcci-screen-tuning`](https://github.com/nicklausFR/ddcci-screen-tuning) to
 adapt monitor brightness and contrast to ambient light.
 
@@ -23,6 +23,23 @@ adapt monitor brightness and contrast to ambient light.
 The consolidated firmware version is
 `tsl2591-ble-nus-2026-07-30-7-wfi`.
 
+## Wiring
+
+The external connections use these XIAO nRF52840 pins:
+
+| Function | Pin |
+| --- | --- |
+| TSL2591 interrupt (`INT`) | D6 |
+| Voltage-divider output | A0 |
+| Red LED | D1 |
+| Green LED | D2 |
+| Push button | D10 |
+
+The LEDs are configured as active-high outputs and start off. The TSL2591
+interrupt and push button use the internal pull-up and trigger on a falling
+edge; wire each input to pull low when active. A0 is configured as an analog
+input. The current BLE payload does not yet publish voltage or GPIO events.
+
 ## BLE protocol
 
 The peripheral advertises as `LuxSensor` with the static random address
@@ -39,22 +56,24 @@ disconnection.
 
 ### Measurements
 
-Measurements use one fixed 15-byte little-endian packet:
+Measurements use one fixed 18-byte little-endian packet:
 
 ```text
-<2sBBfHHHB
+<2sBBfHHHBHB
 ```
 
 | Field | Type | Description |
 | --- | --- | --- |
 | magic | 2 bytes | ASCII `LT` |
-| version | `uint8` | Protocol version, currently `1` |
+| version | `uint8` | Protocol version, currently `2` |
 | quality | `uint8` | Quality flags |
 | lux | `float32` | Lux value; may be `NaN` when no valid value exists |
 | visible | `uint16` | Visible channel count |
 | infrared | `uint16` | Infrared channel count |
 | full | `uint16` | Full-spectrum channel count |
 | gain | `uint8` | Gain index: low, medium, high or maximum |
+| batteryMillivolts | `uint16` | Calibrated battery voltage in mV |
+| batteryPercent | `uint8` | Battery level: 3.2 V = 0 %, 4.2 V = 100 % |
 
 Quality flags are:
 
