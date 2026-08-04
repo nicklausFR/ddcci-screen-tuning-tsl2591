@@ -19,6 +19,7 @@ Adafruit_SPIFlash onboardFlash(&flashTransport);
 BLEUart bleUart;
 struct LightReading;
 struct BatteryReading {
+  uint16_t adc;
   uint16_t millivolts;
   uint8_t percent;
 };
@@ -55,14 +56,15 @@ const unsigned long POWER_OFF_INDICATOR_MS = 2000UL;
 const unsigned long POWER_ON_INDICATOR_MS = 2000UL;
 
 // Battery divider calibration: battery -> 4.7 MOhm -> A0 -> 10 MOhm -> GND.
-// The factor was calibrated with 3.850 V measured at the battery.
-const float ADC_REFERENCE_VOLTAGE = 3.3F;
+// Calibrated with 4.064 V measured at the battery (average ADC: ~969).
+const uint16_t ADC_REFERENCE_MILLIVOLTS = 3300;
 const uint16_t ADC_MAX_VALUE = 1023;
-const float BATTERY_DIVIDER_TOP_RESISTANCE = 4.7F;
-const float BATTERY_DIVIDER_BOTTOM_RESISTANCE = 10.0F;
-const float BATTERY_VOLTAGE_CALIBRATION_FACTOR = 1.0422F;
-const float BATTERY_EMPTY_VOLTAGE = 3.2F;
-const float BATTERY_FULL_VOLTAGE = 4.2F;
+const uint16_t BATTERY_DIVIDER_RATIO_PER_MILLE = 1470;
+const uint16_t BATTERY_CALIBRATION_PER_MILLE = 885;
+const uint16_t BATTERY_EMPTY_MILLIVOLTS = 3200;
+const uint16_t BATTERY_FULL_MILLIVOLTS = 4200;
+const uint8_t BATTERY_ADC_SAMPLE_COUNT = 8;
+const uint8_t BATTERY_ADC_FILTER_NEW_PERCENT = 15;
 
 Timer buttonDebounceTimer(BUTTON_DEBOUNCE_MS);
 Timer buttonLongPressTimer(BUTTON_LONG_PRESS_MS);
@@ -209,6 +211,16 @@ tsl2591IntegrationTime_t integrationTime = TSL2591_INTEGRATIONTIME_200MS;
 bool discardAfterGainChange = DEFAULT_DISCARD_AFTER_GAIN_CHANGE;
 uint8_t ledBrightness = DEFAULT_LED_BRIGHTNESS;
 unsigned long ledBlinkIntervalMs = DEFAULT_LED_BLINK_INTERVAL_MS;
+uint32_t filteredBatteryAdcQ8 = 0;
+bool batteryAdcFilterInitialized = false;
+bool batteryAdcPrimed = false;
+bool usbStateKnown = false;
+bool lastUsbConnected = false;
+bool usbStateNotificationPending = false;
+bool pendingUsbBatteryValid = false;
+uint16_t pendingUsbBatteryMillivolts = 0;
+uint8_t pendingUsbBatteryPercent = 0;
+volatile bool usbInitialStatePending = false;
 
 struct LightReading {
   uint16_t full;
@@ -336,25 +348,54 @@ void logBleHealth(unsigned long now) {
 }
 
 BatteryReading readBattery() {
+  // Conversions occur only when a normal BLE publication is already due.
+  // Average the same eight back-to-back samples used for calibration; this
+  // adds neither a delay nor a periodic wake source.
+  // The first conversion after boot can retain a stale sample-capacitor
+  // value, so discard it once before seeding the filter.
+  if (!batteryAdcPrimed) {
+    analogRead(VOLTAGE_DIVIDER_PIN);
+    batteryAdcPrimed = true;
+  }
   uint32_t total = 0;
-  const uint8_t sampleCount = 8;
-  for (uint8_t sample = 0; sample < sampleCount; sample++) {
+  for (uint8_t sample = 0; sample < BATTERY_ADC_SAMPLE_COUNT; sample++) {
     total += analogRead(VOLTAGE_DIVIDER_PIN);
   }
-  float adc = (float)total / sampleCount;
-  float voltageAtA0 = adc * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE;
-  float voltage = voltageAtA0 *
-                  (BATTERY_DIVIDER_TOP_RESISTANCE +
-                   BATTERY_DIVIDER_BOTTOM_RESISTANCE) /
-                  BATTERY_DIVIDER_BOTTOM_RESISTANCE *
-                  BATTERY_VOLTAGE_CALIBRATION_FACTOR;
-  float percent = (voltage - BATTERY_EMPTY_VOLTAGE) * 100.0F /
-                  (BATTERY_FULL_VOLTAGE - BATTERY_EMPTY_VOLTAGE);
-  percent = constrain(percent, 0.0F, 100.0F);
-  BatteryReading reading = {
-      (uint16_t)roundf(voltage * 1000.0F),
-      (uint8_t)roundf(percent),
-  };
+  uint32_t adcQ8 = (total * 256UL + BATTERY_ADC_SAMPLE_COUNT / 2) /
+                   BATTERY_ADC_SAMPLE_COUNT;
+  if (!batteryAdcFilterInitialized) {
+    filteredBatteryAdcQ8 = adcQ8;
+    batteryAdcFilterInitialized = true;
+  } else {
+    filteredBatteryAdcQ8 =
+        (filteredBatteryAdcQ8 *
+             (100U - BATTERY_ADC_FILTER_NEW_PERCENT) +
+         adcQ8 * BATTERY_ADC_FILTER_NEW_PERCENT + 50U) /
+        100U;
+  }
+
+  uint16_t adc = (uint16_t)((filteredBatteryAdcQ8 + 128U) / 256U);
+  const uint64_t voltageNumerator =
+      (uint64_t)adc * ADC_REFERENCE_MILLIVOLTS *
+      BATTERY_DIVIDER_RATIO_PER_MILLE * BATTERY_CALIBRATION_PER_MILLE;
+  const uint64_t voltageDenominator =
+      (uint64_t)ADC_MAX_VALUE * 1000ULL * 1000ULL;
+  uint16_t millivolts =
+      (uint16_t)((voltageNumerator + voltageDenominator / 2) /
+                 voltageDenominator);
+
+  uint8_t percent = 0;
+  if (millivolts >= BATTERY_FULL_MILLIVOLTS) {
+    percent = 100;
+  } else if (millivolts > BATTERY_EMPTY_MILLIVOLTS) {
+    percent = (uint8_t)((millivolts - BATTERY_EMPTY_MILLIVOLTS + 5U) /
+                        10U);
+  }
+
+  BatteryReading reading;
+  reading.adc = adc;
+  reading.millivolts = millivolts;
+  reading.percent = percent;
   return reading;
 }
 
@@ -520,6 +561,7 @@ void updatePowerIndicators() {
     turnDeviceOff();
     return;
   }
+
   if (powerOnIndicatorActive && powerOnIndicatorTimer.isReached()) {
     powerOnIndicatorActive = false;
     setStatusLeds(false, false);
@@ -599,6 +641,8 @@ void onBleConnected(uint16_t connectionHandle) {
   lastBleCommandMs = firmwareNowMs();
   bleCommandSeen = false;
   lowPowerConnectionRequested = false;
+  usbInitialStatePending = true;
+  usbStateNotificationPending = false;
   resetPublishState();
 }
 
@@ -610,6 +654,8 @@ void onBleDisconnected(uint16_t connectionHandle, uint8_t reason) {
   lastBleCommandMs = 0;
   bleCommandSeen = false;
   lowPowerConnectionRequested = false;
+  usbInitialStatePending = false;
+  usbStateNotificationPending = false;
   bleRxLine = "";
   bleWasConnected = false;
 }
@@ -968,6 +1014,79 @@ void sendJsonLine(JsonDocument& document) {
   }
 }
 
+bool readUsbConnected() {
+  uint32_t usbRegStatus = 0;
+  if (sd_power_usbregstatus_get(&usbRegStatus) != NRF_SUCCESS ||
+      (usbRegStatus & POWER_USBREGSTATUS_VBUSDETECT_Msk) == 0) {
+    return false;
+  }
+
+  return !TinyUSBDevice.mounted() || !TinyUSBDevice.suspended();
+}
+
+void queueUsbStateNotification(bool connected) {
+  usbStateNotificationPending = true;
+  pendingUsbBatteryValid = false;
+  if (!connected) {
+    // USB-biased samples must not leak gradually into the battery display.
+    // Re-seed the EMA from one fresh eight-sample average on this transition.
+    batteryAdcFilterInitialized = false;
+    BatteryReading battery = readBattery();
+    pendingUsbBatteryMillivolts = battery.millivolts;
+    pendingUsbBatteryPercent = battery.percent;
+    pendingUsbBatteryValid = true;
+  }
+}
+
+bool sendUsbState(bool connected) {
+  char message[112];
+  if (pendingUsbBatteryValid) {
+    snprintf(message, sizeof(message),
+             "{\"type\":\"usb\",\"connected\":false,"
+             "\"batteryMillivolts\":%u,\"batteryPercent\":%u}\n",
+             pendingUsbBatteryMillivolts, pendingUsbBatteryPercent);
+  } else {
+    snprintf(message, sizeof(message),
+             "{\"type\":\"usb\",\"connected\":%s}\n",
+             connected ? "true" : "false");
+  }
+  bool sent = writeBleReliably(
+      reinterpret_cast<const uint8_t *>(message), strlen(message));
+  if (sent) {
+    logf(bleLog, LOG_NOTICE,
+         "USB state TX connected=%u battery=%u%% (%umV valid=%u)",
+         connected, pendingUsbBatteryPercent,
+         pendingUsbBatteryMillivolts, pendingUsbBatteryValid);
+  }
+  return sent;
+}
+
+void serviceUsbState(bool bleConnected) {
+  bool connected = readUsbConnected();
+  if (!usbStateKnown || connected != lastUsbConnected) {
+    usbStateKnown = true;
+    lastUsbConnected = connected;
+    if (bleConnected) {
+      queueUsbStateNotification(connected);
+    } else if (!connected) {
+      batteryAdcFilterInitialized = false;
+    }
+  }
+
+  // The connect callback occurs before Windows subscribes to NUS TX.
+  // Wait for the CCCD notification bit so the initial state cannot be lost.
+  if (usbInitialStatePending && bleUart.notifyEnabled()) {
+    usbInitialStatePending = false;
+    queueUsbStateNotification(lastUsbConnected);
+  }
+
+  if (bleConnected && usbStateNotificationPending &&
+      bleUart.notifyEnabled() && sendUsbState(lastUsbConnected)) {
+    usbStateNotificationPending = false;
+    pendingUsbBatteryValid = false;
+  }
+}
+
 void publishReading(const LightReading& reading, unsigned long now) {
   BatteryReading battery = readBattery();
   BleMeasurementPacket packet;
@@ -989,9 +1108,9 @@ void publishReading(const LightReading& reading, unsigned long now) {
                        sizeof(packet))) {
     rememberSentLux(reading.lux, now);
     logf(bleLog, LOG_DEBUG,
-         "measurement notification TX bytes=%u quality=0x%02X gain=%s battery=%u%% (%umV)",
+         "measurement notification TX bytes=%u quality=0x%02X gain=%s battery=%u%% (%umV adc=%u)",
          (unsigned)sizeof(packet), reading.quality, GAIN_NAMES[gainIndex],
-         battery.percent, battery.millivolts);
+         battery.percent, battery.millivolts, battery.adc);
   } else {
     sensorLog.warn("BLE measurement TX failed");
   }
@@ -1354,6 +1473,7 @@ void loop() {
   handleButton(now);
   updatePowerIndicators();
   bool bleConnected = Bluefruit.connected();
+  serviceUsbState(bleConnected);
 
   if (bleConnectEventPending) {
     bleConnectEventPending = false;
