@@ -52,6 +52,11 @@ const unsigned long BUTTON_LONG_PRESS_MS = 1500UL;
 const unsigned long BUTTON_DOUBLE_PRESS_MS = 2000UL;
 const unsigned long DEFAULT_LED_BLINK_INTERVAL_MS = 5000UL;
 const unsigned long STATUS_BLINK_DURATION_MS = 150UL;
+// A double-click forces a BLE resynchronization. Make that action immediately
+// visible without changing the regular connection-status blink cadence.
+const unsigned long BLE_SYNC_INDICATOR_MS = 1000UL;
+const unsigned long BLE_SYNC_INDICATOR_PHASE_MS = 100UL;
+const uint8_t INDICATOR_LED_BRIGHTNESS = 255;
 const unsigned long POWER_OFF_INDICATOR_MS = 2000UL;
 const unsigned long POWER_ON_INDICATOR_MS = 2000UL;
 
@@ -67,10 +72,13 @@ const uint8_t BATTERY_ADC_SAMPLE_COUNT = 8;
 const uint8_t BATTERY_ADC_FILTER_NEW_PERCENT = 15;
 
 Timer buttonDebounceTimer(BUTTON_DEBOUNCE_MS);
+Timer buttonWakeReleaseTimer(BUTTON_DEBOUNCE_MS);
 Timer buttonLongPressTimer(BUTTON_LONG_PRESS_MS);
 Timer buttonDoublePressTimer(BUTTON_DOUBLE_PRESS_MS);
 Timer statusBlinkIntervalTimer(DEFAULT_LED_BLINK_INTERVAL_MS);
 Timer statusBlinkDurationTimer(STATUS_BLINK_DURATION_MS);
+Timer bleSyncIndicatorTimer(BLE_SYNC_INDICATOR_MS);
+Timer bleSyncIndicatorPhaseTimer(BLE_SYNC_INDICATOR_PHASE_MS);
 Timer powerOffIndicatorTimer(POWER_OFF_INDICATOR_MS);
 Timer powerOnIndicatorTimer(POWER_ON_INDICATOR_MS);
 
@@ -95,7 +103,7 @@ const uint8_t DEFAULT_LED_BRIGHTNESS = 32;
 const unsigned long MIN_LED_BLINK_INTERVAL_MS = 500UL;
 const unsigned long MAX_LED_BLINK_INTERVAL_MS = 60000UL;
 
-// BLE Nordic UART Service JSON line commands:
+// Newline-delimited JSON commands over BLE NUS or USB CDC. USB has priority.
 // - {"cmd":"get"} or {"cmd":"current"} immediately republishes the latest
 //   cached reading without triggering a new sensor measurement.
 // - {"cmd":"config.get"} returns the runtime configuration.
@@ -137,11 +145,19 @@ bool buttonLongPressHandled = false;
 bool buttonLongPressTracking = false;
 bool waitingForSecondPress = false;
 bool buttonPressDebounceActive = false;
+// A System OFF wake is a reset while the button is still held. Ignore that
+// physical press until it has been released continuously for the debounce
+// period, otherwise the tail of the wake press could immediately power off
+// the device again.
+bool buttonWakeReleasePending = false;
+bool buttonWakeReleaseDebounceActive = false;
 volatile bool buttonPressInterruptPending = false;
 bool powerOffPending = false;
 bool powerOnIndicatorActive = false;
+bool bleSyncIndicatorActive = false;
+bool bleSyncIndicatorGreenOn = false;
 
-const char *FIRMWARE_VERSION = "tsl2591-ble-nus-2026-08-02-button-led-v2";
+const char *FIRMWARE_VERSION = "tsl2591-usb-priority-2026-08-09-v2";
 const char *BLE_DEVICE_NAME = "LuxSensor";
 const uint8_t BLE_STATIC_ADDRESS[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0xC3};
 const uint16_t FAST_CONNECTION_INTERVAL_MIN_UNITS = 12; // 15 ms
@@ -221,7 +237,8 @@ bool pendingUsbBatteryValid = false;
 uint16_t pendingUsbBatteryMillivolts = 0;
 uint8_t pendingUsbBatteryPercent = 0;
 volatile bool usbInitialStatePending = false;
-
+bool usbTransportActive = false;
+String usbRxLine = "";
 struct LightReading {
   uint16_t full;
   uint16_t ir;
@@ -253,9 +270,10 @@ struct __attribute__((packed)) BleMeasurementPacket {
   uint8_t gain;
   uint16_t batteryMillivolts;
   uint8_t batteryPercent;
+  uint8_t usbConnected;
 };
 
-static_assert(sizeof(BleMeasurementPacket) == 18,
+static_assert(sizeof(BleMeasurementPacket) == 19,
               "Unexpected BLE measurement packet size");
 
 LightReading cachedReading;
@@ -460,12 +478,25 @@ void setStatusLeds(bool redOn, bool greenOn) {
   analogWrite(GREEN_LED_PIN, greenOn ? ledBrightness : 0);
 }
 
+// Action indicators must remain clearly visible even when the regular status
+// LED brightness has been reduced through the BLE configuration.
+void setIndicatorLeds(bool redOn, bool greenOn) {
+  analogWrite(RED_LED_PIN, redOn ? INDICATOR_LED_BRIGHTNESS : 0);
+  analogWrite(GREEN_LED_PIN, greenOn ? INDICATOR_LED_BRIGHTNESS : 0);
+}
+
 void restartBleAdvertising() {
+  if (usbTransportActive) {
+    return;
+  }
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.start(0);
 }
 
 void forceBleReinitialization() {
+  if (usbTransportActive) {
+    return;
+  }
   bleLog.warn("button double press: forcing BLE reinitialization");
   resetPublishState();
   if (Bluefruit.connected() &&
@@ -476,10 +507,18 @@ void forceBleReinitialization() {
   restartBleAdvertising();
 }
 
+void beginBleSyncIndicator() {
+  bleSyncIndicatorActive = true;
+  bleSyncIndicatorGreenOn = true;
+  bleSyncIndicatorTimer.start();
+  bleSyncIndicatorPhaseTimer.start();
+  setIndicatorLeds(false, true);
+}
+
 void beginStartupIndicator() {
   powerOnIndicatorActive = true;
   powerOnIndicatorTimer.start();
-  setStatusLeds(false, true);
+  setIndicatorLeds(false, true);
 }
 
 void beginDevicePowerOff() {
@@ -489,7 +528,7 @@ void beginDevicePowerOff() {
   powerOffPending = true;
   waitingForSecondPress = false;
   powerOffIndicatorTimer.start();
-  setStatusLeds(true, false);
+  setIndicatorLeds(true, false);
   bleLog.notice("button long press: power-off indicator started");
 }
 
@@ -508,13 +547,33 @@ void turnDeviceOff() {
   }
   Bluefruit.Advertising.stop();
   tsl.disable();
-  bleLog.notice("button long press: device switched off");
+  bleLog.notice("button long press: entering System OFF after button release");
+
+  // SYSTEMOFF wakes on the configured level, not an edge. Entering it while
+  // the long-press button is still LOW would therefore reset immediately.
+  // Wait for release without scheduling the regular RTC wake, then leave the
+  // chip in its lowest-power state. The next LOW on D10 resets the firmware.
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    sd_app_evt_wait();
+  }
+  systemOff(BUTTON_PIN, LOW);
+
+  // systemOff() should not return. Keep the CPU asleep if the SoftDevice
+  // rejects the request rather than resuming measurement while marked off.
+  while (true) {
+    sd_app_evt_wait();
+  }
 }
 
 void turnDeviceOn(unsigned long now) {
   if (devicePowered) {
     return;
   }
+  // This press woke the device. If it is held past the long-press threshold,
+  // do not reinterpret the same physical press as a request to power off.
+  // The next release and press starts a new long-press sequence.
+  buttonLongPressTracking = false;
+  buttonLongPressHandled = true;
   devicePowered = true;
   resetLightState();
   resetPublishState();
@@ -530,17 +589,33 @@ void turnDeviceOn(unsigned long now) {
 void updateStatusLed(unsigned long now, bool bleConnected) {
   (void)now;
   if (!devicePowered) {
+    bleSyncIndicatorActive = false;
     setStatusLeds(false, false);
     return;
   }
 
   if (powerOffPending) {
-    setStatusLeds(true, false);
+    bleSyncIndicatorActive = false;
+    setIndicatorLeds(true, false);
+    return;
+  }
+
+  if (bleSyncIndicatorActive) {
+    if (bleSyncIndicatorTimer.isReached()) {
+      bleSyncIndicatorActive = false;
+      setStatusLeds(false, false);
+      return;
+    }
+    if (bleSyncIndicatorPhaseTimer.isReached()) {
+      bleSyncIndicatorGreenOn = !bleSyncIndicatorGreenOn;
+      bleSyncIndicatorPhaseTimer.start();
+      setIndicatorLeds(false, bleSyncIndicatorGreenOn);
+    }
     return;
   }
 
   if (powerOnIndicatorActive) {
-    setStatusLeds(false, true);
+    setIndicatorLeds(false, true);
     return;
   }
 
@@ -553,7 +628,10 @@ void updateStatusLed(unsigned long now, bool bleConnected) {
   }
   statusBlinkIntervalTimer.start();
   statusBlinkDurationTimer.start();
-  setStatusLeds(!bleConnected, bleConnected);
+  // USB CDC is also a healthy connected transport. Red is reserved for the
+  // state where neither USB nor BLE has a host connection.
+  bool transportConnected = usbTransportActive || bleConnected;
+  setStatusLeds(!transportConnected, transportConnected);
 }
 
 void updatePowerIndicators() {
@@ -573,6 +651,34 @@ void updatePowerIndicators() {
 
 void handleButton(unsigned long now) {
   bool rawPressed = digitalRead(BUTTON_PIN) == LOW;
+
+  if (buttonWakeReleasePending) {
+    if (rawPressed) {
+      // A release bounce does not count: require a complete stable release.
+      buttonWakeReleaseDebounceActive = false;
+      return;
+    }
+
+    if (!buttonWakeReleaseDebounceActive) {
+      buttonWakeReleaseTimer.start();
+      buttonWakeReleaseDebounceActive = true;
+      return;
+    }
+
+    if (!buttonWakeReleaseTimer.isReached()) {
+      return;
+    }
+
+    buttonWakeReleasePending = false;
+    buttonWakeReleaseDebounceActive = false;
+    buttonRawPressed = false;
+    buttonStablePressed = false;
+    noInterrupts();
+    buttonPressInterruptPending = false;
+    interrupts();
+    bleLog.debug("System OFF wake button released; new presses enabled");
+    return;
+  }
 
   // A long press is only valid while the button is continuously held. Do not
   // reuse the first short click's timer when the user begins a second click.
@@ -613,6 +719,7 @@ void handleButton(unsigned long now) {
       buttonLongPressHandled = true;
       buttonLongPressTracking = false;
       bleLog.notice("button double press detected; resetting BLE link");
+      beginBleSyncIndicator();
       forceBleReinitialization();
       return;
     }
@@ -1001,16 +1108,52 @@ bool writeBleReliably(const uint8_t *data, size_t length) {
   return complete;
 }
 
+bool writeUsbReliably(const uint8_t *data, size_t length) {
+  size_t offset = 0;
+  uint32_t deadline = millis() + 2000;
+  while (offset < length && usbTransportActive) {
+    size_t written = Serial.write(data + offset, length - offset);
+    if (written > 0) {
+      offset += written;
+      continue;
+    }
+
+    if ((long)(millis() - deadline) >= 0) {
+      break;
+    }
+    delay(2);
+  }
+  return offset == length;
+}
+
 void sendJsonLine(JsonDocument& document) {
   String line;
   line.reserve(320);
   serializeJson(document, line);
-  logf(bleLog, LOG_DEBUG, "BLE JSON TX %s", line.c_str());
   const uint8_t *data =
       reinterpret_cast<const uint8_t *>(line.c_str());
-  if (writeBleReliably(data, line.length())) {
+  bool sent = false;
+  if (usbTransportActive) {
+    // Send protocol data before debug output. Logging the full JSON first can
+    // fill TinyUSB's CDC buffer and used to truncate the actual response.
+    sent = writeUsbReliably(data, line.length());
+  } else {
+    logf(bleLog, LOG_DEBUG, "BLE JSON TX %s", line.c_str());
+    sent = writeBleReliably(data, line.length());
+  }
+  if (sent) {
     const uint8_t newline = '\n';
-    writeBleReliably(&newline, 1);
+    if (usbTransportActive) {
+      writeUsbReliably(&newline, 1);
+      Serial.flush();
+      logf(bleLog, LOG_DEBUG, "USB JSON TX bytes=%u",
+           (unsigned)line.length());
+    } else {
+      writeBleReliably(&newline, 1);
+    }
+  } else if (usbTransportActive) {
+    logf(bleLog, LOG_WARN, "USB write incomplete expected=%u",
+         (unsigned)line.length());
   }
 }
 
@@ -1061,29 +1204,37 @@ bool sendUsbState(bool connected) {
   return sent;
 }
 
-void serviceUsbState(bool bleConnected) {
+void stopBleForUsb() {
+  Bluefruit.Advertising.stop();
+  if (Bluefruit.connected() &&
+      bleConnectionHandle != BLE_CONN_HANDLE_INVALID) {
+    Bluefruit.disconnect(bleConnectionHandle);
+  }
+  bleWasConnected = false;
+  bleRxLine = "";
+  resetPublishState();
+}
+
+void serviceTransport() {
   bool connected = readUsbConnected();
   if (!usbStateKnown || connected != lastUsbConnected) {
     usbStateKnown = true;
     lastUsbConnected = connected;
-    if (bleConnected) {
-      queueUsbStateNotification(connected);
-    } else if (!connected) {
+    usbTransportActive = connected;
+    if (connected) {
+      stopBleForUsb();
+      bleLog.notice("transport=USB_CDC BLE=disabled");
+    } else {
       batteryAdcFilterInitialized = false;
+      resetPublishState();
+      restartBleAdvertising();
+      bleLog.notice("transport=BLE USB=disconnected advertising=resumed");
     }
   }
-
-  // The connect callback occurs before Windows subscribes to NUS TX.
-  // Wait for the CCCD notification bit so the initial state cannot be lost.
-  if (usbInitialStatePending && bleUart.notifyEnabled()) {
-    usbInitialStatePending = false;
-    queueUsbStateNotification(lastUsbConnected);
-  }
-
-  if (bleConnected && usbStateNotificationPending &&
-      bleUart.notifyEnabled() && sendUsbState(lastUsbConnected)) {
-    usbStateNotificationPending = false;
-    pendingUsbBatteryValid = false;
+  // restartOnDisconnect is useful in BLE mode but may briefly restart the
+  // advertiser after USB forced a disconnection. Keep the radio silent.
+  if (connected && Bluefruit.Advertising.isRunning()) {
+    Bluefruit.Advertising.stop();
   }
 }
 
@@ -1092,7 +1243,7 @@ void publishReading(const LightReading& reading, unsigned long now) {
   BleMeasurementPacket packet;
   packet.magic[0] = 'L';
   packet.magic[1] = 'T';
-  packet.version = 2;
+  packet.version = 3;
   packet.quality = reading.quality;
   packet.lux = (!isnan(reading.lux) && !isinf(reading.lux) &&
                 reading.lux >= 0.0F)
@@ -1104,8 +1255,26 @@ void publishReading(const LightReading& reading, unsigned long now) {
   packet.gain = gainIndex;
   packet.batteryMillivolts = battery.millivolts;
   packet.batteryPercent = battery.percent;
-  if (writeBleReliably(reinterpret_cast<const uint8_t *>(&packet),
-                       sizeof(packet))) {
+  packet.usbConnected = usbTransportActive ? 1 : 0;
+  if (usbTransportActive) {
+    JsonDocument document;
+    document["type"] = "measurement";
+    if (isnan(packet.lux) || isinf(packet.lux)) {
+      document["lux"] = nullptr;
+    } else {
+      document["lux"] = packet.lux;
+    }
+    document["quality"] = packet.quality;
+    document["visible"] = packet.visible;
+    document["ir"] = packet.ir;
+    document["full"] = packet.full;
+    document["gain"] = packet.gain;
+    document["batteryMillivolts"] = packet.batteryMillivolts;
+    document["batteryPercent"] = packet.batteryPercent;
+    sendJsonLine(document);
+    rememberSentLux(reading.lux, now);
+  } else if (writeBleReliably(reinterpret_cast<const uint8_t *>(&packet),
+                              sizeof(packet))) {
     rememberSentLux(reading.lux, now);
     logf(bleLog, LOG_DEBUG,
          "measurement notification TX bytes=%u quality=0x%02X gain=%s battery=%u%% (%umV adc=%u)",
@@ -1351,34 +1520,37 @@ bool handleJsonCommand(const String& line, unsigned long now) {
 
 bool processJsonCommands(unsigned long now) {
   bool published = false;
+  Stream& input = usbTransportActive ? static_cast<Stream&>(Serial)
+                                     : static_cast<Stream&>(bleUart);
+  String& rxLine = usbTransportActive ? usbRxLine : bleRxLine;
 
-  while (bleUart.available() > 0) {
-    char c = (char)bleUart.read();
+  while (input.available() > 0) {
+    char c = (char)input.read();
 
     if (c == '\r') {
       continue;
     }
 
     if (c == '\n') {
-      bleRxLine.trim();
-      if (bleRxLine.length() > 0) {
+      rxLine.trim();
+      if (rxLine.length() > 0) {
         lastBleCommandMs = now;
         bleCommandSeen = true;
-        if (handleJsonCommand(bleRxLine, now)) {
+        if (handleJsonCommand(rxLine, now)) {
           published = true;
         }
       }
-      bleRxLine = "";
+      rxLine = "";
       continue;
     }
 
-    if (bleRxLine.length() >= COMMAND_MAX_LENGTH) {
-      bleRxLine = "";
+    if (rxLine.length() >= COMMAND_MAX_LENGTH) {
+      rxLine = "";
       sendCommandError("", "command_too_long");
       continue;
     }
 
-    bleRxLine += c;
+    rxLine += c;
   }
 
   return published;
@@ -1399,6 +1571,11 @@ void sleepUntilNextSensorRead(unsigned long now) {
   if (buttonPressDebounceActive && sleepMs > BUTTON_DEBOUNCE_MS) {
     sleepMs = BUTTON_DEBOUNCE_MS;
   }
+  // Keep the BLE resynchronization indicator visibly fast even while the
+  // firmware would otherwise wait for the next sensor polling interval.
+  if (bleSyncIndicatorActive && sleepMs > BLE_SYNC_INDICATOR_PHASE_MS) {
+    sleepMs = BLE_SYNC_INDICATOR_PHASE_MS;
+  }
   sleepForMs(sleepMs);
 }
 
@@ -1417,6 +1594,7 @@ void setup() {
   bootLog.notice("USB serial ready baud=115200");
   turnOffUserLeds();
   configureExternalHardware();
+  buttonWakeReleasePending = buttonRawPressed;
   bootLog.notice("external GPIO configured leds=D1,D2 button=D10 voltage=A0 tslInt=D6");
   onboardFlash.begin();
   logf(bootLog, LOG_NOTICE, "QSPI JEDEC ID before deep power-down=0x%06lX",
@@ -1429,12 +1607,15 @@ void setup() {
 
   nrfClock.begin();
   buttonDebounceTimer.setNowProvider(firmwareNowMs);
+  buttonWakeReleaseTimer.setNowProvider(firmwareNowMs);
   buttonLongPressTimer.setNowProvider(firmwareNowMs);
   buttonDoublePressTimer.setNowProvider(firmwareNowMs);
   statusBlinkIntervalTimer.setNowProvider(firmwareNowMs);
   statusBlinkDurationTimer.setNowProvider(firmwareNowMs);
   powerOffIndicatorTimer.setNowProvider(firmwareNowMs);
   powerOnIndicatorTimer.setNowProvider(firmwareNowMs);
+  bleSyncIndicatorTimer.setNowProvider(firmwareNowMs);
+  bleSyncIndicatorPhaseTimer.setNowProvider(firmwareNowMs);
   wakeHandler.begin(nrfClock);
   wakeHandler.beginRtcWake(RTC_WAKE_MASK);
   nrfWfi.setSuspendSysTickDuringSleep(true);
@@ -1442,6 +1623,13 @@ void setup() {
   nrfWfi.begin();
 
   configureBle();
+  usbTransportActive = readUsbConnected();
+  usbStateKnown = true;
+  lastUsbConnected = usbTransportActive;
+  if (usbTransportActive) {
+    stopBleForUsb();
+    bootLog.notice("transport=USB_CDC BLE=disabled");
+  }
   bool flashAsleep = putOnboardFlashInDeepPowerDown();
   logf(bootLog, flashAsleep ? LOG_NOTICE : LOG_WARN,
        "QSPI deep power-down=%s", flashAsleep ? "confirmed" : "not_confirmed");
@@ -1472,8 +1660,8 @@ void loop() {
   unsigned long now = firmwareNowMs();
   handleButton(now);
   updatePowerIndicators();
-  bool bleConnected = Bluefruit.connected();
-  serviceUsbState(bleConnected);
+  serviceTransport();
+  bool bleConnected = !usbTransportActive && Bluefruit.connected();
 
   if (bleConnectEventPending) {
     bleConnectEventPending = false;
@@ -1501,7 +1689,7 @@ void loop() {
   }
   bleWasConnected = bleConnected;
 
-  if (bleConnected && processJsonCommands(now)) {
+  if ((usbTransportActive || bleConnected) && processJsonCommands(now)) {
     return;
   }
 
@@ -1541,7 +1729,7 @@ void loop() {
 
   cacheReading(reading);
 
-  if (!bleConnected) {
+  if (!usbTransportActive && !bleConnected) {
     return;
   }
 
