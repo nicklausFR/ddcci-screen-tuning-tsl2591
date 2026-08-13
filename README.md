@@ -25,20 +25,19 @@ The consolidated firmware version is
 
 ## Wiring
 
-The external connections use these XIAO nRF52840 pins:
-
-| Function | Pin |
-| --- | --- |
-| TSL2591 interrupt (`INT`) | D6 |
-| Voltage-divider output | A0 |
-| Red LED | D1 |
-| Green LED | D2 |
-| Push button | D10 |
-
-The LEDs are configured as active-high outputs and start off. The TSL2591
-interrupt and push button use the internal pull-up and trigger on a falling
-edge; wire each input to pull low when active. A0 is configured as an analog
-input. The current BLE payload does not yet publish voltage or GPIO events.
+```text
+A0     -> junction: BAT+ through 4.7 MOhm / GND through 10 MOhm
+          capacitor 104 (100 nF) between A0 and GND
+A1/D1  -> 100-220 Ohm -> red LED -> GND
+A2/D2  -> 100-220 Ohm -> green LED -> GND
+A4/D4  -> TSL2591 SDA
+A5/D5  -> TSL2591 SCL
+D6     -> TSL2591 INT
+D10    -> push button -> GND (internal pull-up)
+3V3    -> TSL2591 VCC
+GND    -> TSL2591 GND
+BAT    -> LiPo 250 mAh, 3.7 V
+```
 
 ## BLE protocol
 
@@ -231,25 +230,3 @@ py .\ble_idle_power_client.py
 For a meaningful current measurement, disconnect USB after flashing, power
 the XIAO through its battery input, and compare advertising current with idle
 connected current.
-
-## Build and upload
-
-The project is configured for Arduino CLI / Arduino Maker Workshop in
-`sketch.yaml`.
-
-Compile:
-
-```powershell
-arduino-cli compile --profile profile-1782939730789 --output-dir build .
-```
-
-Upload, replacing `COM12` if necessary:
-
-```powershell
-arduino-cli upload --profile profile-1782939730789 --port COM12 --input-dir build .
-```
-
-`update-workshop-port.ps1` can update the port stored in `sketch.yaml`.
-Required libraries include ArduinoJson, Adafruit TSL2591, Adafruit Unified
-Sensor and Adafruit BusIO; Bluefruit and the nRF52 support libraries come from
-the Seeed nRF52 board package.
