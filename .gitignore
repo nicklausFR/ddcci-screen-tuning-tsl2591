@@ -1,6 +1,33 @@
 build/
+build-diagnostics/
+tmp/
+.library-staging/
+.vscode/
 *.tmp
 *.log
 __pycache__/
 *.py[cod]
 .staging-ddcci/
+
+# Local hardware and BLE diagnostics
+ble_csharp_probe/
+ble_idle_power_test/
+ble_wfi_windows_test/
+gpio_pin_scanner/
+gpio_test/
+hardware_test/
+led_test/
+tsl2591_test/
+usb_cdc_protocol_test/
+voltage_divider_test/
+wfi_interrupt_power_test/
+ble_adv_receiver.py
+ble_idle_power_client.py
+ble_wfi_windows_test.py
+test_ddcci_ble_integration.py
+usb_cdc_probe.py
+wait_for_dfu_upload.ps1
+
+# Local Arduino tools
+sketch.yaml
+update-workshop-port.ps1
