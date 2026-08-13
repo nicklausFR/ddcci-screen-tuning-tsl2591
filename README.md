@@ -43,7 +43,7 @@ input. The current BLE payload does not yet publish voltage or GPIO events.
 ## BLE protocol
 
 The peripheral advertises as `LuxSensor` with the static random address
-`C2:05:04:03:02:01`. It exposes Nordic UART Service:
+`C3:05:04:03:02:01`. It exposes Nordic UART Service:
 
 - service: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
 - RX/write: `6e400002-b5a3-f393-e0a9-e50e24dcca9e`

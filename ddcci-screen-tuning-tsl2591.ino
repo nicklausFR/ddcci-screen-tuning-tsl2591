@@ -61,11 +61,13 @@ const unsigned long POWER_OFF_INDICATOR_MS = 2000UL;
 const unsigned long POWER_ON_INDICATOR_MS = 2000UL;
 
 // Battery divider calibration: battery -> 4.7 MOhm -> A0 -> 10 MOhm -> GND.
-// Calibrated with 4.064 V measured at the battery (average ADC: ~969).
-const uint16_t ADC_REFERENCE_MILLIVOLTS = 3300;
+// The nRF52 Arduino core uses the internal 0.6 V reference at gain 1/6, hence
+// a 3.6 V full-scale SAADC range (not the board's 3.3 V supply). Calibrated
+// in-circuit with 4.207 V at the battery and 2.904 V at A0.
+const uint16_t ADC_REFERENCE_MILLIVOLTS = 3600;
 const uint16_t ADC_MAX_VALUE = 1023;
 const uint16_t BATTERY_DIVIDER_RATIO_PER_MILLE = 1470;
-const uint16_t BATTERY_CALIBRATION_PER_MILLE = 885;
+const uint16_t BATTERY_CALIBRATION_PER_MILLE = 872;
 const uint16_t BATTERY_EMPTY_MILLIVOLTS = 3200;
 const uint16_t BATTERY_FULL_MILLIVOLTS = 4200;
 const uint8_t BATTERY_ADC_SAMPLE_COUNT = 8;
@@ -157,7 +159,7 @@ bool powerOnIndicatorActive = false;
 bool bleSyncIndicatorActive = false;
 bool bleSyncIndicatorGreenOn = false;
 
-const char *FIRMWARE_VERSION = "tsl2591-usb-priority-2026-08-09-v2";
+const char *FIRMWARE_VERSION = "tsl2591-usb-recovery-2026-08-13-v2";
 const char *BLE_DEVICE_NAME = "LuxSensor";
 const uint8_t BLE_STATIC_ADDRESS[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0xC3};
 const uint16_t FAST_CONNECTION_INTERVAL_MIN_UNITS = 12; // 15 ms
@@ -1164,7 +1166,11 @@ bool readUsbConnected() {
     return false;
   }
 
-  return !TinyUSBDevice.mounted() || !TinyUSBDevice.suspended();
+  // VBUS alone only proves that a charger is attached.  Do not disable BLE
+  // until a host has enumerated TinyUSB and opened the CDC session (DTR).
+  // This also makes closing the serial port resume BLE while the cable stays
+  // connected, instead of pinning the sensor to a dead USB transport.
+  return TinyUSBDevice.mounted() && !TinyUSBDevice.suspended() && Serial;
 }
 
 void queueUsbStateNotification(bool connected) {
@@ -1235,6 +1241,15 @@ void serviceTransport() {
   // advertiser after USB forced a disconnection. Keep the radio silent.
   if (connected && Bluefruit.Advertising.isRunning()) {
     Bluefruit.Advertising.stop();
+  }
+
+  // Defensive recovery: Windows can abandon a GATT connection while the
+  // SoftDevice has already stopped advertising.  If no transport remains,
+  // never leave the sensor permanently undiscoverable.
+  if (!connected && !Bluefruit.connected() &&
+      !Bluefruit.Advertising.isRunning()) {
+    Bluefruit.Advertising.start(0);
+    bleLog.warn("BLE advertising was idle without a transport; restarted");
   }
 }
 
