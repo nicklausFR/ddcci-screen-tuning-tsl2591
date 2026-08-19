@@ -189,3 +189,9 @@ If Windows still holds a stale session:
    for the 20-second supervision timeout, then relaunch.
 
 Power-cycling or reflashing the XIAO should not normally be necessary.
+
+## License
+
+Copyright (C) 2026 nicklausFR
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
